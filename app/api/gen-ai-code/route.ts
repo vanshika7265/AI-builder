@@ -1,12 +1,15 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest } from "next/server";
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
 import { db } from "@/lib/prisma";
 import { CREDIT_COST_PER_GENERATION } from "@/lib/constants";
 import type { Message, FileData } from "@/types/workspace";
 import { aj } from "@/lib/arcjet";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+const ai = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY!,
+  baseURL: process.env.OPENAI_BASE_URL!,
+});
 
 // ─── SSE helper ───────────────────────────────────────────────────────────────
 
@@ -15,20 +18,10 @@ function sseEvent(type: string, payload: unknown): string {
 }
 
 // ─── Extract short label from a Gemini thought chunk ─────────────────────────
-// Gemini thoughts often start with a bold heading like **Verify Config**
+
 // We extract that. If no bold heading, take the first sentence only.
 
-function extractThoughtLabel(text: string): string | null {
-  // Try to grab **bold heading** at the start
-  const boldMatch = text.match(/\*\*([^*]{4,60})\*\*/);
-  if (boldMatch) return boldMatch[1].trim();
 
-  // Fall back to first sentence (up to first . or \n), capped at 60 chars
-  const sentence = text.split(/[.\n]/)[0].trim();
-  if (sentence.length >= 8 && sentence.length <= 80) return sentence;
-
-  return null;
-}
 
 // ─── npm validation ───────────────────────────────────────────────────────────
 
@@ -91,29 +84,22 @@ function buildContents(messages: Message[], fileData: FileData | null) {
   const trimmed = trimHistory(messages);
 
   return trimmed.map((msg, idx) => {
-    const role = msg.role === "assistant" ? "model" : "user";
+    let text = msg.content;
 
-    if (msg.role === "user") {
-      const parts: object[] = [];
-
-      let text = msg.content;
-
-      if (msg.imageUrl) {
-        text = `[The user has attached an image. Use this URL directly in the generated app where relevant (as img src, background-image, etc.): ${msg.imageUrl}]\n\n${text}`;
-      }
-
-      const isLast = idx === trimmed.length - 1;
-      if (isLast && fileData) {
-        text +=
-          "\n\nCurrent project files for context:\n" +
-          JSON.stringify(fileData, null, 2);
-      }
-
-      parts.push({ text });
-      return { role, parts };
+    if (
+      msg.role === "user" &&
+      idx === trimmed.length - 1 &&
+      fileData
+    ) {
+      text +=
+        "\n\nCurrent project files:\n" +
+        JSON.stringify(fileData, null, 2);
     }
 
-    return { role, parts: [{ text: msg.content }] };
+    return {
+      role: msg.role === "assistant" ? "assistant" : "user",
+      content: text,
+    } as const;
   });
 }
 
@@ -182,50 +168,40 @@ export async function POST(request: NextRequest) {
       try {
         const contents = buildContents(messages, fileData);
 
-        console.log("API KEY EXISTS:", !!process.env.GEMINI_API_KEY);
+        console.log("API KEY EXISTS:", !!process.env.OPENROUTER_API_KEY);
+
 console.log(
   "API KEY PREFIX:",
-  process.env.GEMINI_API_KEY?.slice(0, 10)
+  process.env.OPENROUTER_API_KEY?.slice(0, 10)
+
 );
 
-        const geminiStream = await ai.models.generateContentStream({
-            model: "gemini-3.5-flash",
-          contents,
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.7,
-            responseMimeType: "application/json",
-            thinkingConfig: {
-              includeThoughts: true,
-            },
-          },
-        });
+const aiStream = await ai.chat.completions.create({
+  model: process.env.MODEL!,
+  messages: [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT,
+    },
+    ...contents,
+  ] as OpenAI.Chat.ChatCompletionMessageParam[],
+  stream: true,
+  temperature: 0.7,
+});
 
         let accumulated = ""; // final JSON output
-        let lastEmitTime = 0; // throttle thought emissions
+         // throttle thought emissions
 
-        for await (const chunk of geminiStream) {
-          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+      
 
-          for (const part of parts) {
-            if (!part.text) continue;
+        for await (const chunk of aiStream) {
+  const text =
+    chunk.choices[0]?.delta?.content;
 
-            if (part.thought) {
-              // Extract just the short label — not the full wall of text
-              const now = Date.now();
-              if (now - lastEmitTime > 600) {
-                const label = extractThoughtLabel(part.text);
-                if (label) {
-                  enqueue(sseEvent("status", { message: label }));
-                  lastEmitTime = now;
-                }
-              }
-            } else {
-              // Actual JSON output
-              accumulated += part.text;
-            }
-          }
-        }
+  if (text) {
+    accumulated += text;
+  }
+}
 
         // ── Parse the complete JSON response ──────────────────────────────────
 
